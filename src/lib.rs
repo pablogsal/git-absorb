@@ -6,6 +6,8 @@ mod commute;
 mod config;
 mod owned;
 mod stack;
+#[cfg(test)]
+mod weave;
 
 use git2::DiffStats;
 use std::io::Write;

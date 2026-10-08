@@ -5,8 +5,8 @@ use anyhow::{anyhow, Result};
 mod commute;
 mod config;
 mod owned;
+mod rewrite;
 mod stack;
-#[cfg(test)]
 mod weave;
 
 use git2::DiffStats;
@@ -22,6 +22,7 @@ pub struct Config<'a> {
     pub and_rebase: bool,
     pub rebase_options: &'a Vec<&'a str>,
     pub whole_file: bool,
+    pub rewrite: bool,
     pub one_fixup_per_commit: bool,
     pub squash: bool,
     pub message: Option<&'a str>,
@@ -41,6 +42,9 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
         return Err(anyhow!(
             "REBASE_OPTIONS were specified without --and-rebase flag"
         ));
+    }
+    if config.rewrite && repo.config()?.get_bool("commit.gpgsign").unwrap_or(false) {
+        return Err(anyhow!("--rewrite cannot sign, but commit.gpgSign is set"));
     }
 
     let mut we_added_everything_to_index = false;
@@ -79,7 +83,9 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
         ret.context_lines(0)
             .id_abbrev(40)
             .ignore_filemode(true)
-            .ignore_submodules(true);
+            .ignore_submodules(true)
+            // attribute lines the way git blame does, where a diff is ambiguous
+            .indent_heuristic(config.rewrite);
         ret
     });
 
@@ -128,7 +134,8 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
 
     let mut modified_hunks_without_target = 0usize;
     let mut non_modified_patches = 0usize;
-    'patch: for index_patch in index.iter() {
+    // with --rewrite, the hunks are attributed by line ownership further down
+    'patch: for index_patch in index.iter().filter(|_| !config.rewrite) {
         let old_path = index_patch.new_path.as_slice();
         if index_patch.status != git2::Delta::Modified {
             debug!(logger, "skipped non-modified patch";
@@ -358,6 +365,11 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
         }
     }
 
+    if config.rewrite {
+        (non_modified_patches, modified_hunks_without_target) =
+            rewrite::run(repo, &stack, &index, &mut head_tree, config.dry_run, logger)?;
+    }
+
     if we_added_everything_to_index {
         // now that the fixup commits have been created,
         // we should unstage the remaining changes from the index.
@@ -582,6 +594,8 @@ fn index_stats(repo: &git2::Repository) -> Result<git2::DiffStats> {
 enum Announcement<'r> {
     Committed(&'r git2::Commit<'r>, &'r str, &'r git2::DiffStats),
     WouldHaveCommitted(&'r str, &'r git2::DiffStats),
+    Rewrote(&'r git2::Commit<'r>, git2::Oid),
+    WouldHaveRewritten(&'r git2::Commit<'r>),
     WouldHaveRebased(&'r std::process::Command),
     HowToSquash(String),
     NothingStagedAfterAutoStaging,
@@ -589,6 +603,7 @@ enum Announcement<'r> {
     NoFileModifications,
     NonFileModifications,
     FileModificationsWithoutTarget,
+    FileModificationsWithoutSingleOwner,
     CannotFixUpPastFirstCommit,
     CannotFixUpPastMerge(&'r git2::Commit<'r>),
     WillNotFixUpPastAnotherAuthor(&'r git2::Commit<'r>),
@@ -621,6 +636,19 @@ fn announce(logger: &slog::Logger, announcement: Announcement) {
             "fixup" => fixup,
             "header" => format_change_header(diff),
         ),
+        Announcement::Rewrote(commit, new) => info!(
+            logger,
+            "rewrote";
+            "commit" => commit.summary().unwrap_or_default(),
+            "from" => &commit.id().to_string()[..7],
+            "to" => &new.to_string()[..7],
+        ),
+        Announcement::WouldHaveRewritten(commit) => info!(
+            logger,
+            "would have rewritten";
+            "commit" => commit.summary().unwrap_or_default(),
+            "from" => &commit.id().to_string()[..7],
+        ),
         Announcement::WouldHaveRebased(command) => info!(
             logger, "would have run git rebase"; "command" => format!("{:?}", command)
         ),
@@ -652,6 +680,11 @@ fn announce(logger: &slog::Logger, announcement: Announcement) {
             logger,
             "Some file modifications did not have an available commit to fix up. \
                 You will have to manually create fixup commits."
+        ),
+        Announcement::FileModificationsWithoutSingleOwner => warn!(
+            logger,
+            "Some file modifications did not clearly belong to one commit, \
+                so they were not absorbed."
         ),
         Announcement::CannotFixUpPastFirstCommit => warn!(
             logger,
@@ -2116,6 +2149,7 @@ lines
         and_rebase: false,
         rebase_options: &Vec::new(),
         whole_file: false,
+        rewrite: false,
         one_fixup_per_commit: false,
         squash: false,
         message: None,

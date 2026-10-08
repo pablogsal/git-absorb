@@ -46,6 +46,9 @@ struct Cli {
     /// Match the change against the complete file
     #[clap(long, short)]
     whole_file: bool,
+    /// Rewrite the commits directly instead of creating fixup commits
+    #[clap(long, conflicts_with_all = ["and_rebase", "whole_file", "one_fixup_per_commit", "squash", "message"])]
+    rewrite: bool,
     /// Only generate one fixup per commit
     #[clap(long, short = 'F')]
     one_fixup_per_commit: bool,
@@ -70,6 +73,7 @@ fn main() {
         rebase_options,
         gen_completions,
         whole_file,
+        rewrite,
         one_fixup_per_commit,
         squash,
         message,
@@ -126,6 +130,7 @@ fn main() {
             rebase_options: &rebase_options,
             no_limit,
             whole_file,
+            rewrite,
             one_fixup_per_commit,
             squash,
             message: message.as_deref(),

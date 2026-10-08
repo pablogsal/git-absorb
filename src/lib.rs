@@ -2123,6 +2123,145 @@ lines
         assert_eq!(actual_msg, expected_msg);
     }
 
+    /// Commit each of `contents` in turn as the whole test file, stage
+    /// `staged`, and absorb. Returns the file in each of those commits.
+    fn rewrite(
+        contents: &[&str],
+        staged: &str,
+        dry_run: bool,
+    ) -> (repo_utils::Context, Vec<String>, Vec<serde_json::Value>) {
+        let (ctx, path) = repo_utils::prepare_repo();
+        for content in contents {
+            std::fs::write(ctx.join(&path), content).unwrap();
+            let tree = repo_utils::add(&ctx.repo, &path);
+            let head = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+            repo_utils::commit(&ctx.repo, "HEAD", content, &tree, &[&head]);
+        }
+        std::fs::write(ctx.join(&path), staged).unwrap();
+        repo_utils::add(&ctx.repo, &path);
+
+        let mut capturing_logger = log_utils::CapturingLogger::new();
+        let config = Config {
+            rewrite: true,
+            dry_run,
+            ..DEFAULT_CONFIG
+        };
+        run_with_repo(&capturing_logger.logger, &config, &ctx.repo).unwrap();
+
+        // every commit has the content that it was made with as its message
+        let mut commit = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+        let mut files = Vec::new();
+        for content in contents.iter().rev() {
+            assert_eq!(commit.message().unwrap(), *content);
+            let blob = commit.tree().unwrap().get_path(&path).unwrap();
+            let blob = blob.to_object(&ctx.repo).unwrap().peel_to_blob().unwrap();
+            files.insert(0, String::from_utf8(blob.content().to_vec()).unwrap());
+            commit = commit.parent(0).unwrap();
+        }
+        drop(commit);
+        (ctx, files, capturing_logger.visible_logs())
+    }
+
+    #[test]
+    fn rewrite_absorbs_into_the_commits_that_own_the_lines() {
+        // each character stands for one line
+        let lines = |text: &str| text.chars().flat_map(|c| [c, '\n']).collect::<String>();
+        let cases: &[(&[&str], &str, &[&str])] = &[
+            // each changed line goes to the commit that added it
+            (&["1", "12", "123"], "a2c", &["a", "a2", "a2c"]),
+            (&["1", "12", "123"], "a123c", &["a1", "a12", "a123c"]),
+            (&["1", "12", "123"], "1bb3", &["1", "1bb", "1bb3"]),
+            // deleted lines leave the commits that added them
+            (&["1", "12", "123"], "", &["", "", ""]),
+            // also across lines that another commit added and removed
+            (&["13", "123", "13"], "1b", &["1b", "12b", "1b"]),
+            (&["1234", "124"], "1cd4", &["1cd34", "1cd4"]),
+            // new lines between two commits could belong to either
+            (&["1", "12", "123"], "1a23", &["1", "12", "123"]),
+            // nor is there one commit for a rewrite of lines from several
+            (&["1", "12", "123"], "abc", &["1", "12", "123"]),
+            // lines that were not next to each other in an older commit
+            (&["112233", "1133"], "aaa", &["112233", "1133"]),
+            // a new line with nowhere certain to go in the middle commit
+            (&["1", "21", "1"], "a1", &["1", "21", "1"]),
+        ];
+        for (contents, staged, expected) in cases {
+            let contents: Vec<_> = contents.iter().map(|text| lines(text)).collect();
+            let contents: Vec<_> = contents.iter().map(String::as_str).collect();
+            let expected: Vec<_> = expected.iter().map(|text| lines(text)).collect();
+            let (ctx, files, _) = rewrite(&contents, &lines(staged), false);
+            assert_eq!(files, expected, "{contents:?} with {staged:?} staged");
+            // whatever was not absorbed is still staged
+            let absorbed = nothing_left_in_index(&ctx.repo).unwrap();
+            assert_eq!(
+                absorbed,
+                files != contents,
+                "{contents:?} with {staged:?} staged"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_only_touches_the_commits_it_has_to() {
+        let (ctx, _, logs) = rewrite(
+            &["a\nb\n", "a\nb\nc\n", "a\nb\nc\nd\n"],
+            "a\nb\nC\nd\n",
+            false,
+        );
+        let old_head = ctx.repo.find_reference("PRE_ABSORB_HEAD").unwrap();
+        let old = old_head.peel_to_commit().unwrap().parent(0).unwrap();
+        let new = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+        let new = new.parent(0).unwrap();
+        // the commit below the one that absorbs is not rewritten
+        assert_ne!(new.id(), old.id());
+        assert_eq!(new.parent_id(0).unwrap(), old.parent_id(0).unwrap());
+        // only the absorbing commit is announced, not the one on top of it
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["msg"], "rewrote");
+        assert_eq!(logs[0]["to"], new.id().to_string()[..7]);
+    }
+
+    #[test]
+    fn rewrite_dry_run_changes_nothing() {
+        let (ctx, files, logs) = rewrite(&["a\n", "a\nb\n"], "A\nb\n", true);
+        assert_eq!(files, ["a\n", "a\nb\n"]);
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+        assert!(ctx.repo.find_reference("PRE_ABSORB_HEAD").is_err());
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["msg"], "would have rewritten");
+    }
+
+    #[test]
+    fn rewrite_leaves_files_without_final_newline_intact() {
+        // the "a" line would have to end with a newline in the first commit
+        // and without one in the second
+        let (ctx, files, logs) = rewrite(&["k\na\nb\n", "k\na\n"], "k\nA", false);
+        assert_eq!(files, ["k\na\nb\n", "k\na\n"]);
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+        assert!(logs[0]["msg"].as_str().unwrap().contains("not absorbed"));
+    }
+
+    #[test]
+    fn rewrite_stops_at_a_signed_commit() {
+        let ctx = repo_utils::prepare_and_stage();
+        let head = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+        let (header, message) = (head.raw_header().unwrap(), head.message().unwrap());
+        let signed = format!("{header}\n{message}");
+        let signed = ctx.repo.commit_signed(&signed, "signature", None).unwrap();
+        let master = ctx.repo.reference("refs/heads/master", signed, true, "");
+        master.unwrap();
+
+        let capturing_logger = log_utils::CapturingLogger::new();
+        let config = Config {
+            rewrite: true,
+            ..DEFAULT_CONFIG
+        };
+        run_with_repo(&capturing_logger.logger, &config, &ctx.repo).unwrap();
+        // the only commit is out of reach, so nothing is absorbed
+        assert_eq!(ctx.repo.head().unwrap().target(), Some(signed));
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
     /// Perform a revwalk from HEAD, extracting the commit messages.
     fn extract_commit_messages(repo: &git2::Repository) -> Vec<String> {
         let mut revwalk = repo.revwalk().unwrap();

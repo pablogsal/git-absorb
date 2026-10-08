@@ -88,6 +88,11 @@ FLAGS
         Match the first commit touching the same file as the current hunk.
         Use this with care!
 
+--rewrite::
+        Rewrite the commits directly instead of creating fixup commits.
+        Each change goes into the commit that added the lines it touches.
+        A change that does not clearly belong to one commit is not absorbed.
+
 -h::
 --help::
         Prints help information
